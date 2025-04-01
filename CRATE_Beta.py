@@ -5,6 +5,7 @@ from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
 import torch.nn.functional as F
 import torch.nn.init as init
+import yaml
 
 class SparseMSSA(nn.Module):
     def __init__(self,
@@ -37,9 +38,9 @@ class SparseMSSA(nn.Module):
         )
 
     def forward(self, x, data_token_num):
-        if(data_token_num + self.memory_token_num > x.size(0)):
-            data_token_num = x.size(0) - self.memory_token_num
-
+        if(data_token_num + self.memory_token_num > x.size(1)):
+            data_token_num = x.size(1) - self.memory_token_num
+        print("data_token_num = ", data_token_num)
         qkv = self.qkv(x[:,:(self.memory_token_num + data_token_num), :])
         tokens = rearrange(qkv, 'b n (h d) -> b h n d', h=self.heads)
 
@@ -260,3 +261,152 @@ class CRATEImgClassifier(nn.Module):
             return logits, x_reconstruct
         else:
             return logits
+
+class FractalAtom(nn.Module):
+    def __init__(self,
+                 Global_token_num,
+                 G_hidden,
+                 Data_token_num,
+                 dim_x,
+                 dim_qkv,
+                 head_num,
+                 Layernum,
+                 dim_out,
+                 C=4,
+                 eta=0.1,
+                 lmbda=0.1,
+                 dropout=0.0,
+                 memory_decay=True):
+        super().__init__()
+
+        self.global_token_num = Global_token_num
+        self.data_token_num = Data_token_num
+        self.pos_embedding = nn.Parameter(torch.randn(1, Data_token_num + Global_token_num, dim_x))
+        self.global_token = nn.Parameter(torch.randn(1, Global_token_num, dim_x))
+        self.crate_beta = CRATEEncoder(dim_x,
+                                       Layernum,
+                                       head_num,
+                                       dim_qkv // head_num,
+                                       Global_token_num,
+                                       G_hidden,
+                                       C,
+                                       eta,
+                                       lmbda,
+                                       dropout,
+                                       memory_decay)
+        self.ln1 = nn.LayerNorm(Global_token_num)
+        self.linear1 = nn.Linear(Global_token_num, 1)
+        self.ln2 = nn.LayerNorm(dim_x)
+        self.linear2 = nn.Linear(dim_x, dim_out)
+
+    def forward(self, x):
+        batchsize, n, _ = x.shape
+        if(n != self.data_token_num):
+            print("in FractalAtom, x.shape is wrong")
+            return None
+
+        global_tokens = repeat(self.global_token, '1 g d -> b g d', b=batchsize)
+        x = torch.concatenate((global_tokens, x), dim=1)
+        x += self.pos_embedding[:, :(self.data_token_num + self.global_token_num)]
+        x = self.crate_beta(x, self.data_token_num)
+        z = x[:, :self.global_token_num]
+        z = self.ln1(z.transpose(-1, -2))
+        z = self.linear1(z)
+        z = self.ln2(z.transpose(-1, -2))
+        z = self.linear2(z)
+
+        return z
+
+class FractalImageEncoder(nn.Module):
+    def __init__(self,
+                 batchsize,
+                 channels,
+                 arch_file):
+        super().__init__()
+
+        with open(arch_file, 'r') as file:
+            arch = yaml.safe_load(file)
+
+        self.input_size = arch['input_size']
+        self.K = arch['K']
+        self.M = arch['M']
+        if(self.K ** self.M != self.input_size):
+            print('in FractalImageEncoder, arch is wrong, K ** M != input_size')
+            return
+
+        self.pixel_embedding_dim = arch['pixel_embedding_dim']
+        self.pixel_embedding_kernel_size = arch['pixel_embedding_kernel_size']
+        self.pixel_embedding = nn.Sequential(
+            nn.Conv2d(channels, self.pixel_embedding_dim, self.pixel_embedding_kernel_size),
+            nn.BatchNorm2d(self.pixel_embedding_dim),
+            nn.GELU()
+        )
+
+        self.data_token_num = self.K ** 2
+        self.Global_token_num_sets = arch['Global_token_num']
+        self.G_hidden = arch['G_hidden']
+        self.Data_token_num = arch['Data_token_num']
+        for i in range(self.M):
+            if(self.data_token_num != self.Data_token_num[i]):
+                print('in FractalImageEncoder, arch is wrong, data_token_num != Data_token_num[i]， i = ', i)
+
+        self.dim_x = arch['dim_x']
+        self.dim_qkv = arch['dim_qkv']
+        self.head_num = arch['head_num']
+        self.Layernum = arch['Layernum']
+        self.dim_out = arch['dim_out']
+        self.C = arch['C']
+        self.eta = arch['eta']
+        self.lmbda = arch['lmbda']
+        self.dropout = arch['dropout']
+        self.memory_decay = arch['memory_decay']
+
+        self.atoms = nn.ModuleList()
+        for level in range(self.M):
+            level = self.M - level - 1
+            if(level == self.M - 1):
+                self.atoms.extend([Rearrange('b c (h p1) (w p2) -> (b h w) (p1 p2) c', p1=self.K, p2=self.K),
+                                   FractalAtom(Global_token_num=self.Global_token_num_sets[level],
+                                         G_hidden=self.G_hidden[level],
+                                         Data_token_num=self.Data_token_num[level],
+                                         dim_x=self.dim_x[level],
+                                         dim_qkv=self.dim_qkv[level],
+                                         head_num=self.head_num[level],
+                                         Layernum=self.Layernum[level],
+                                         dim_out=self.dim_out[level],
+                                         C=self.C[level],
+                                         eta=self.eta[level],
+                                         lmbda=self.lmbda[level],
+                                         dropout=self.dropout[level],
+                                         memory_decay=self.memory_decay[level])])
+            else:
+                self.atoms.extend([Rearrange('(b t p) n d -> (b t) (n p) d', b=batchsize, p=self.K * self.K),
+                                   FractalAtom(Global_token_num=self.Global_token_num_sets[level],
+                                               G_hidden=self.G_hidden[level],
+                                               Data_token_num=self.Data_token_num[level],
+                                               dim_x=self.dim_x[level],
+                                               dim_qkv=self.dim_qkv[level],
+                                               head_num=self.head_num[level],
+                                               Layernum=self.Layernum[level],
+                                               dim_out=self.dim_out[level],
+                                               C=self.C[level],
+                                               eta=self.eta[level],
+                                               lmbda=self.lmbda[level],
+                                               dropout=self.dropout[level],
+                                               memory_decay=self.memory_decay[level])])
+
+
+
+
+    def forward(self, x):
+        x_ = self.pixel_embedding(x)
+        for index, op in enumerate(self.atoms):
+            print("计算前维度: ", x_.shape)
+            x_ = op(x_)
+            print("计算后维度: ", x_.shape)
+        return x_
+
+
+
+
+
